@@ -172,11 +172,18 @@ function splitMessage(content) {
 
 // ── Routes ────────────────────────────────────────────────────
 app.get('/health', async (req, res) => {
+  const tokenSet = !!DISCORD_TOKEN;
+  const tokenPreview = DISCORD_TOKEN ? DISCORD_TOKEN.slice(0, 8) + '...' : 'NOT SET';
   try {
-    const bot = await getBotInfo();
-    res.json({ ok: true, bot: bot.username });
+    const r = await fetch(`${DISCORD_API}/users/@me`, { headers: discordHeaders() });
+    const body = await r.json();
+    if (r.ok) {
+      res.json({ ok: true, bot: body.username, tokenPreview });
+    } else {
+      res.json({ ok: false, status: r.status, discordError: body, tokenSet, tokenPreview });
+    }
   } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+    res.status(500).json({ ok: false, error: e.message, tokenSet, tokenPreview });
   }
 });
 
