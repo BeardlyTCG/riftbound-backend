@@ -1,14 +1,13 @@
 {
   "name": "riftbound-backend",
   "version": "1.0.0",
-  "description": "Riftbound Notes Discord sync backend",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
-    "discord.js": "^14.14.1",
-    "express": "^4.18.2"
+    "express": "^4.18.2",
+    "node-fetch": "^2.7.0"
   }
 }
