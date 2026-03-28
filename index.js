@@ -1,6 +1,6 @@
 const express = require('express');
 const cors = require('cors');
-const { Client, GatewayIntentBits } = require('discord.js');
+const fetch = require('node-fetch');
 
 const app = express();
 app.use(express.json({ limit: '50kb' }));
@@ -8,6 +8,9 @@ app.use(cors({
   origin: process.env.ALLOWED_ORIGIN || '*',
   methods: ['POST', 'GET']
 }));
+
+const DISCORD_TOKEN = process.env.DISCORD_BOT_TOKEN;
+const DISCORD_API = 'https://discord.com/api/v10';
 
 // ── Legend → Thread ID map ────────────────────────────────────
 const LEGEND_THREADS = {
@@ -60,138 +63,168 @@ const LEGEND_THREADS = {
   'garen':         '1487191961310990376'
 };
 
-// ── Discord client ────────────────────────────────────────────
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent
-  ]
-});
-
-let botReady = false;
-client.once('ready', () => {
-  console.log(`Bot logged in as ${client.user.tag}`);
-  botReady = true;
-});
-client.login(process.env.DISCORD_BOT_TOKEN);
-
-// ── Helpers ───────────────────────────────────────────────────
-function getThreadId(legendName) {
-  return LEGEND_THREADS[legendName.toLowerCase().trim()] || null;
+// ── Discord REST helpers ──────────────────────────────────────
+function discordHeaders() {
+  return {
+    'Authorization': `Bot ${DISCORD_TOKEN}`,
+    'Content-Type': 'application/json'
+  };
 }
 
-function buildDiscordMessage(payload) {
+async function getPinnedMessages(threadId) {
+  const r = await fetch(`${DISCORD_API}/channels/${threadId}/pins`, {
+    headers: discordHeaders()
+  });
+  if (!r.ok) throw new Error(`Failed to fetch pins: ${r.status}`);
+  return r.json();
+}
+
+async function postMessage(threadId, content) {
+  const r = await fetch(`${DISCORD_API}/channels/${threadId}/messages`, {
+    method: 'POST',
+    headers: discordHeaders(),
+    body: JSON.stringify({ content })
+  });
+  if (!r.ok) {
+    const err = await r.text();
+    throw new Error(`Failed to post message: ${r.status} ${err}`);
+  }
+  return r.json();
+}
+
+async function editMessage(threadId, messageId, content) {
+  const r = await fetch(`${DISCORD_API}/channels/${threadId}/messages/${messageId}`, {
+    method: 'PATCH',
+    headers: discordHeaders(),
+    body: JSON.stringify({ content })
+  });
+  if (!r.ok) {
+    const err = await r.text();
+    throw new Error(`Failed to edit message: ${r.status} ${err}`);
+  }
+  return r.json();
+}
+
+async function pinMessage(threadId, messageId) {
+  const r = await fetch(`${DISCORD_API}/channels/${threadId}/pins/${messageId}`, {
+    method: 'PUT',
+    headers: discordHeaders()
+  });
+  if (!r.ok) throw new Error(`Failed to pin message: ${r.status}`);
+}
+
+async function getBotInfo() {
+  const r = await fetch(`${DISCORD_API}/users/@me`, { headers: discordHeaders() });
+  if (!r.ok) throw new Error(`Failed to get bot info: ${r.status}`);
+  return r.json();
+}
+
+// ── Message builder ───────────────────────────────────────────
+function buildMessage(payload) {
   const { legend, matchup, stats, mulligan, aiSummary, timestamp } = payload;
-
   const matchupLabel = matchup === '__all__' ? 'All Matchups' : `vs ${matchup}`;
-  const date = new Date(timestamp).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
+  const date = new Date(timestamp).toLocaleDateString('en-GB', {
+    day: '2-digit', month: 'short', year: 'numeric'
+  });
 
-  let msg = '';
-  msg += `# ${legend} — ${matchupLabel}\n`;
+  let msg = `# ${legend} — ${matchupLabel}\n`;
   msg += `*Last updated: ${date}*\n\n`;
 
-  // Stats
   msg += `## Stats\n`;
-  msg += `**Win Rate:** ${stats.winRate}%  |  **Record:** ${stats.wins}W - ${stats.losses}L  |  **Games:** ${stats.total}\n`;
+  msg += `**Win Rate:** ${stats.winRate}%  |  **Record:** ${stats.wins}W–${stats.losses}L  |  **Games:** ${stats.total}\n`;
   msg += `**Going First:** ${stats.wrFirst !== null ? stats.wrFirst + '%' : '—'}  |  **Going Second:** ${stats.wrSecond !== null ? stats.wrSecond + '%' : '—'}\n\n`;
 
-  // Mulligan table
   if (mulligan && mulligan.length > 0) {
-    msg += `## Mulligan Data\n`;
-    msg += `\`\`\`\n`;
-    msg += `Card              Kept WR   Sent WR   Diff   Games\n`;
-    msg += `─────────────────────────────────────────────────\n`;
+    msg += `## Mulligan Data\n\`\`\`\n`;
+    msg += `Card               Kept WR   Sent WR   Diff    Games\n`;
+    msg += `──────────────────────────────────────────────────────\n`;
     mulligan.forEach(row => {
-      const name = row.card.padEnd(17).slice(0, 17);
-      const kept = (row.keptWR !== null ? row.keptWR + '%' : '—').padEnd(9);
-      const sent = (row.sentWR !== null ? row.sentWR + '%' : '—').padEnd(9);
-      const diff = (row.diff !== null ? (row.diff > 0 ? '+' : '') + row.diff + '%' : '—').padEnd(6);
+      const name  = row.card.padEnd(18).slice(0, 18);
+      const kept  = (row.keptWR !== null ? row.keptWR + '%' : '—').padEnd(9);
+      const sent  = (row.sentWR !== null ? row.sentWR + '%' : '—').padEnd(9);
+      const diff  = (row.diff !== null ? (row.diff > 0 ? '+' : '') + row.diff + '%' : '—').padEnd(7);
       msg += `${name} ${kept} ${sent} ${diff} ${row.games}\n`;
     });
     msg += `\`\`\`\n\n`;
   }
 
-  // AI summary
   if (aiSummary) {
     msg += `## Coach Analysis\n`;
-    // Strip markdown bold for Discord (Discord uses ** too so keep it, just clean up extra)
-    msg += aiSummary.replace(/\n{3,}/g, '\n\n') + '\n';
+    msg += aiSummary.replace(/\n{3,}/g, '\n\n');
   }
 
   return msg;
 }
 
+// Split message into <=2000 char chunks on newlines
+function splitMessage(content) {
+  const chunks = [];
+  let remaining = content;
+  while (remaining.length > 1990) {
+    let splitAt = remaining.lastIndexOf('\n', 1990);
+    if (splitAt <= 0) splitAt = 1990;
+    chunks.push(remaining.slice(0, splitAt));
+    remaining = remaining.slice(splitAt + 1);
+  }
+  if (remaining.trim()) chunks.push(remaining);
+  return chunks;
+}
+
 // ── Routes ────────────────────────────────────────────────────
-app.get('/health', (req, res) => {
-  res.json({ ok: true, botReady });
+app.get('/health', async (req, res) => {
+  try {
+    const bot = await getBotInfo();
+    res.json({ ok: true, bot: bot.username });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
 app.post('/push', async (req, res) => {
-  if (!botReady) {
-    return res.status(503).json({ error: 'Bot not ready yet, try again in a few seconds' });
-  }
-
   const { legend, matchup, stats, mulligan, aiSummary } = req.body;
   if (!legend) return res.status(400).json({ error: 'Missing legend' });
 
-  const threadId = getThreadId(legend);
-  if (!threadId) {
-    return res.status(404).json({ error: `No thread found for legend: ${legend}` });
-  }
+  const threadId = LEGEND_THREADS[legend.toLowerCase().trim()];
+  if (!threadId) return res.status(404).json({ error: `No thread mapped for: ${legend}` });
 
   try {
-    const thread = await client.channels.fetch(threadId);
-    if (!thread) return res.status(404).json({ error: 'Thread not found in Discord' });
+    const bot = await getBotInfo();
+    const botId = bot.id;
 
-    const content = buildDiscordMessage({
-      legend, matchup: matchup || '__all__', stats, mulligan, aiSummary,
+    const content = buildMessage({
+      legend, matchup: matchup || '__all__',
+      stats, mulligan, aiSummary,
       timestamp: Date.now()
     });
+    const chunks = splitMessage(content);
 
-    // Discord messages have a 2000 char limit — split if needed
-    const chunks = [];
-    let remaining = content;
-    while (remaining.length > 1950) {
-      let splitAt = remaining.lastIndexOf('\n', 1950);
-      if (splitAt === -1) splitAt = 1950;
-      chunks.push(remaining.slice(0, splitAt));
-      remaining = remaining.slice(splitAt);
-    }
-    chunks.push(remaining);
-
-    // Check if there's already a pinned message from the bot
-    const pins = await thread.messages.fetchPinned();
-    const botPin = pins.find(m => m.author.id === client.user.id);
+    // Check existing pins from bot
+    const pins = await getPinnedMessages(threadId);
+    const botPin = pins.find(m => m.author && m.author.id === botId);
 
     if (botPin) {
-      // Edit the first pinned message with chunk 1, delete old extra chunks if any
-      await botPin.edit(chunks[0]);
-      // For extra chunks — fetch recent messages to find them, delete and repost
-      if (chunks.length > 1) {
-        const recent = await thread.messages.fetch({ limit: 20 });
-        const extras = recent.filter(m => m.author.id === client.user.id && m.id !== botPin.id);
-        for (const [, m] of extras) await m.delete().catch(() => {});
-        for (let i = 1; i < chunks.length; i++) {
-          await thread.send(chunks[i]);
-        }
+      // Edit the pinned message with first chunk
+      await editMessage(threadId, botPin.id, chunks[0]);
+      // Post remaining chunks if any
+      for (let i = 1; i < chunks.length; i++) {
+        await postMessage(threadId, chunks[i]);
       }
     } else {
-      // First time — post all chunks and pin the first one
-      const first = await thread.send(chunks[0]);
-      await first.pin();
+      // First push — post and pin
+      const first = await postMessage(threadId, chunks[0]);
+      await pinMessage(threadId, first.id);
       for (let i = 1; i < chunks.length; i++) {
-        await thread.send(chunks[i]);
+        await postMessage(threadId, chunks[i]);
       }
     }
 
     res.json({ ok: true, legend, threadId });
   } catch (err) {
-    console.error('Discord push error:', err);
+    console.error('Push error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
 // ── Start ─────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Riftbound backend running on port ${PORT}`));
